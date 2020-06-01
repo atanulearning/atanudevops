@@ -1,0 +1,147 @@
+#This script creates a single GCP instance and a single VPC
+  
+
+from terrascript import Terrascript, provider
+from compute.gcp.create_instance.createInstance import *
+from network.gcp.create_vpc.createVPC import *
+from network.gcp.create_subnet.createSubnet import *
+from network.gcp.create_route.createRoute import *
+from network.gcp.create_firewall.createFirewall import *
+
+ts = Terrascript()
+
+# Add a provider (+= syntax)
+ts += provider('google', credentials='${file("account.json")}',
+               project='testy-mctesterson-229415', region='us-east-1')
+
+
+#****************************************
+# Create a Google VPC
+vpcArgList = {'name' : "vpc0",
+				'description' : "",
+				'auto_create_subnetworks' : "",
+				'routing_mode' : "",
+				'project' : ""}
+
+vpc0 = ts.add(createVPC(vpcArgList))
+
+#****************************************
+# Create a Google VPC
+vpcArgList = {'name' : "vpc1",
+                'description' : "",
+                'auto_create_subnetworks' : "",
+                'routing_mode' : "",
+                'project' : ""}
+
+vpc1 = ts.add(createVPC(vpcArgList))
+
+#***************************************
+# Create a subnet
+subnetArgList0 = {'name' : "subnet0",
+    'ip_cidr_range' : "10.20.20.0/24",
+    'network' : "vpc0",
+    'description' : 'description',
+    'enable_flow_logs' : "",
+    'secondary_ip_range' : "",
+    'private_ip_google_access' : "",
+    'region' : "europe-west3",
+    'project' : "",
+	'depends_on' : [vpc0]}
+
+subnet0 = ts.add(createSubnet(subnetArgList0))
+
+
+#***************************************
+# Create a subnet
+subnetArgList0 = {'name' : "subnet1",
+	'ip_cidr_range' : "10.10.10.0/24",
+    'network' : "vpc1",
+    'description' : 'description',
+    'enable_flow_logs' : "",
+    'secondary_ip_range' : "",
+    'private_ip_google_access' : "",
+    'region' : "europe-west3",
+    'project' : "",
+    'depends_on' : [vpc1]}
+
+subnet1 = ts.add(createSubnet(subnetArgList0))
+
+
+#*****************************************
+# Create a route
+routeArgList0 = {'name' : "route0",
+    'description' : "",
+    'network' : "vpc0",
+	'dest_range' : '0.0.0.0/24',
+    'priority' : "",
+    'tags' : [""],
+    'next_hop_gateway' : "",
+    'next_hop_ip' : "10.20.20.1",
+    'next_hop_vpn_tunnel' : "",
+    'project' : "",
+    'next_hop_instance_zone' : "",
+	'depends_on' : [subnet0]}
+
+route0 = ts.add(createRoute(routeArgList0))
+
+#******************************************
+# Create a firewall rule
+
+fwArgList0 = {'name' : "fw0",
+        'description' : "",
+        'network' : "",
+        'destination_ranges' : "0.0.0.0/0",
+        'allow' : "",
+        'deny' : "",
+        'direction' : "",
+        'disabled' : "",
+        'enable_logging' : "",
+        'priority' : "",
+        'source_ranges' : "",
+        'source_service_accounts' : "",
+        'source_tags' : "",
+        'target_service_accounts' : "",
+        'target_tags' : "",
+        'project' : "",
+        'depends_on' : [vpc0]}
+
+#fw0 = ts.add(createFirewall(fwArgList0))
+
+#******************************************
+# Add a Google instance
+
+# The arg list allows a standardized definition of instance resources
+iArgList = {'boot_disk' : "debian-cloud/debian-9",
+			'machine_type' : "n1-standard-1",
+			'name' : "testinstance",
+			'zone' : "europe-west3-a",
+			'network_interfaces' : ["subnet0","subnet1","","","","","",""],
+			'attached_disk' : "",
+			'can_ip_forward' : "",
+			'create_timeout' : "",
+			'description' : "",
+			'deletion_protection' : "",
+			'hostname' : "",
+			'guest_accelerator' : "",
+			'labels' : "",
+			'metadata' : "",
+			'min_cpu_platform' : "",
+			'allow_stopping_for_update' : "",
+			'project' : "",
+			'scheduling' : "",
+			'scratch_disk' : "",
+			'service_account' : "",
+			'allow_stopping_for_update' : "",
+			'tags' : "",
+			'depends_on' : [subnet0, subnet1]
+}
+
+ts.add(createInstance(iArgList))
+#***********************************************
+
+# Print the JSON-style configuration to stdout for convenience.
+print(ts.dump())
+
+# Write JSON to main.tf
+f = open("main.tf", "w")
+f.write(ts.dump())
