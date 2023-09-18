@@ -1,0 +1,253 @@
+## Includes ###########################################################################################
+
+#Set-Item Env:\SuppressAzurePowerShellBreakingChangeWarnings "true" ## uncomment for showcase runs
+$ErrorActionPreference = "stop"     # Errors will stop the script rather than continue.
+. .\subsystem\Connect-Azure.ps1     # Include login script
+. .\subsystem\Get-DataFromVnet.ps1   # Include datagatherer  
+. .\subsystem\Set-String.ps1         # Make manual data-input easy
+. .\subsystem\Measure-ScriptTiming.ps1 # Save timing and show avarage.
+
+## Part I: Data input #################################################################################
+
+$sub="org-hec-0273"
+$layer= "nonprod"                      # prod/nonprod
+$sid= "WDDATT"
+$fqdn= "fiori.atento.com"
+$backendIPs=@('10.126.253.28')         # example: @('192.168.174.15','192.168.174.16')
+$backendPort = 44380
+$backendProtocol = "https"
+
+$frontcertPath="C:\Users\IXXX0\Downloads\fiori_pfx\1.pfx"
+$passwdPath="C:\Users\IXXX0\Downloads\fiori_pfx\key.txt"            # "C:\Users\IXXX0\Downloads\pfxPassword.txt"
+
+$frontEndPort=443
+$frontEndProtocol = "https"
+$healthProbePath = "/ping/publicicp/show_init_statepub.icp"   # web-dispatcher default path is /sap/wdisp/admin/public/default.html  or /ping/publicicp/show_init_statepub.icp
+#$apgNumber="02" ## Get this from the number of existing gateways. Check for prod, nonprod.
+$SkuTier="WAF"              # Standard, WAF, Standard_v2, WAF_v2
+$SkuName="WAF_Medium"       # Standard_Small, Standard_Medium, Standard_Large, WAF_Medium, WAF_Large, Standard_v2, WAF_v2
+
+$SslPolicyName="AppGwSslPolicy20170401S"
+
+##App GW v2 parameters
+#$Zones=@("1","2"."3")
+#$SubnetForAppGWv2=
+
+## Part II: sanity check ###############################################################################
+
+if ($frontEndProtocol -eq "https" -or $frontEndProtocol -eq "https" ) {
+    #Sane
+}else {
+    Write-Host "Check frontEndProtocol."
+    Return -1
+}
+
+try {
+    openssl version
+}
+catch {
+    Write-Output "Please install openssl and set the PATH system variable to the openssl/bin folder in the advanced system settings. (https://medium.com/swlh/installing-openssl-on-windows-10-and-updating-path-80992e26f6a1)"
+    Return -1
+}
+
+## Part III: logic #####################################################################################
+
+$startTime = Get-Date
+Write-Host "Starting AppGW deployment. $startTime"
+Connect-Azure($sub)         # Connect to Azure, get Subsription sap-mce-devnetops-test
+$location=$rg_name=$hec_cid=""
+$VNet = Get-DataFromVnet -location ([ref]$location) -rg ([ref]$rg_Name) -hec_cid ([ref]$hec_cid)
+
+$AppGWs = Get-AzApplicationGateway -ResourceGroupName $rg_Name
+if ( $AppGWs -is [System.Object]) {
+    "Existing Application Gateway(s) found:"
+    $counter=0
+    $AppGWs | ForEach-Object {
+        $counter++
+        Write-Host $counter ":" $_.Name
+    }
+    if ($counter -gt 1) {
+        Write-Host "Two application gateways exist already. Please add your setup there"
+        return -1
+    } 
+    elseif ($counter -eq 1) {
+        if ($AppGWs.Name -like $layer) {
+            Write-Host "AppGW for this layer exist already. Please add your setup manually for now."
+            return -1
+        }
+
+        if ($AppGWs.Name.Split('-')[-1] -eq "01") {
+            $apgNumber = "02"
+        }
+        elseif ($AppGWs.Name.Split('-')[-1] -eq "02") {
+            $apgNumber = "01"
+        }
+        else {
+            Write-Host "Could not determin AppGW number."
+            return -1
+        }
+    }
+} 
+else {
+    $apgNumber = "01"
+}
+
+$apgName = "apg-"+$hec_cid+"-"+$layer+"-"+$apgNumber
+$bpName = "bp-"+$hec_cid+"-"+$layer+"-"+$sid
+$httpsettingName = "httpsetting-"+$hec_cid+"-"+$layer+"-"+$sid
+$listenerName="listener-"+$hec_cid+"-"+$frontEndProtocol+"-"+$layer+"-"+$sid
+$apgRuleName="apgrule-"+$hec_cid+"-"+$layer+"-"+$sid
+$frontEndIpName = "pip-"+$apgName
+$FrontendPortName="port_"+$frontEndPort
+$healthProbeName = "hp-"+$hec_cid+"-"+$sid+"-"+$backendPort
+
+# Get network config
+Write-Host "Creating new public ip."
+$PublicIp = New-AzPublicIpAddress -ResourceGroupName $rg_Name -Name $frontEndIpName -Location $location -AllocationMethod "Dynamic"
+Write-Host "Creating new FrontEnd ip config."
+$FrontEndIpConfig = New-AzApplicationGatewayFrontendIPConfig -Name "appGwPublicFrontendIp" -PublicIPAddress $PublicIp
+Write-Host "Get AppGw Subnet."
+$Subnet = Get-AzVirtualNetworkSubnetConfig -Name "ApplicationGatewaySubnet" -VirtualNetwork $VNet 
+Write-Host "Creating new AppGW ip config."
+$GatewayIPconfig = New-AzApplicationGatewayIPConfiguration -Name "appGatewayIpConfig" -Subnet $Subnet
+Write-Host "Creating new BackEnd Port."
+$BackendPool = New-AzApplicationGatewayBackendAddressPool -Name $bpName -BackendIPAddresses $backendIPs
+
+#get cert from backend
+Write-Host "Get backend certificate(s)."
+$VMs = Get-AzVM -ResourceGroupName $rg_name
+$VM_Name = $VMs[0].Name
+$AuthCert=@()
+$backendIPs | ForEach-Object {
+    $thisBackendIP=$_
+    Write-Host "Connecting to next backend."
+    $remoteCommand = "openssl s_client -showcerts -connect "+ $thisBackendIP +":"+$backendPort+" </dev/null | sed -ne '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p;/-----END CERTIFICATE-----/q'"
+    Set-Content -Path .\subsystem\command.script -Value $remoteCommand
+    $output1 = Invoke-AzVMRunCommand -ResourceGroupName $rg_name -VMName $VM_Name -CommandId 'RunShellScript' -ScriptPath .\subsystem\command.script
+    $strings = $output1.Value.Message -split "\[stdout\]"
+    $certText = $strings[1] -split "\[stderr\]"
+    $certSubject = $certText[0] | openssl x509 -noout -subject
+    $certParameter= $certSubject.Split("=")
+    $certCN= $certParameter[$certParameter.Count -1]
+    $certCN = $certCN -replace '\*',"star"
+    $path= $env:userprofile + "\Downloads\" + $certCN.Trim() + ".cer"
+    $certText[0].Trim() | Out-File -FilePath $path
+    $AuthCert += New-AzApplicationGatewayAuthenticationCertificate -Name $certCN.Trim() -CertificateFile $path
+    Write-Host "Backend certificate saved."
+}
+Write-host "All backend certificates saved."
+
+Write-Host "Creating new connection draining."
+$connectionDraining = New-AzApplicationGatewayConnectionDraining -Enabled $True -DrainTimeoutInSec 60
+Write-Host "Creating new http setting."
+$httpsetting = New-AzApplicationGatewayBackendHttpSetting -Name $httpsettingName -Port $backendPort -Protocol $backendProtocol -CookieBasedAffinity "Enabled" -ConnectionDraining $connectionDraining -AuthenticationCertificates $AuthCert
+#$httpsettingDummy = New-AzApplicationGatewayBackendHttpSetting -Name "dummy" -Port 80 -Protocol "http" -CookieBasedAffinity "Enabled"
+
+Write-Host "Create frontEnd certificate."
+$passwd = Get-Content $passwdPath | ConvertTo-SecureString -AsPlainText -Force
+$frontCertName = $fqdn +"_"+ $startTime.Year
+$frontCert = New-AzApplicationGatewaySSLCertificate -Name $frontCertName -CertificateFile $frontcertPath -Password $passwd
+
+Write-Host "Creating new FrontEnd Port"
+$FrontEndPort = New-AzApplicationGatewayFrontendPort -Name $FrontendPortName -Port $frontEndPort
+Write-Host "Creating new Listener."
+if ($frontEndProtocol -eq "http") {
+    $Listener = New-AzApplicationGatewayHttpListener -Name $listenerName -Protocol $frontEndProtocol -FrontendIpConfiguration $FrontEndIpConfig -FrontendPort $FrontEndPort -HostName $fqdn
+}
+elseif ($frontEndProtocol -eq "https") {
+    $Listener = New-AzApplicationGatewayHttpListener -Name $listenerName -Protocol $frontEndProtocol -FrontendIpConfiguration $FrontEndIpConfig -FrontendPort $FrontEndPort -HostName $fqdn -SSLCertificate $frontCert
+}
+Write-Host "Creating new SSL policy."
+$SslPolicy = New-AzApplicationGatewaySslPolicy -PolicyType Predefined -PolicyName $SslPolicyName
+
+Write-Host "Creating new Rule."
+$Rule = New-AzApplicationGatewayRequestRoutingRule -Name $apgRuleName -RuleType Basic -BackendHttpSettings $httpsetting -HttpListener $Listener -BackendAddressPool $BackendPool
+
+Write-Host "Creating new SKU."
+$Sku = New-AzApplicationGatewaySku -Name $SkuName -Tier $SkuTier -Capacity 2
+
+Write-Host "Deploying AppGW. This may take a while (about 15 minutes)."
+Write-Host "Current time is" (get-Date).DateTime
+$startTimeAppGw = Get-Date
+if ($SkuTier -eq "WAF_v2") {
+    $AppGateway = New-AzApplicationGateway -Name $apgName -ResourceGroupName $rg_Name -Location $location -BackendAddressPools $BackendPool -BackendHttpSettingsCollection $httpsetting -FrontendIpConfigurations $FrontEndIpConfig  -GatewayIpConfigurations $GatewayIpConfig -FrontendPorts $FrontEndPort -HttpListeners $Listener -RequestRoutingRules $Rule -Sku $Sku -FirewallPolicy $firewallPolicy -AuthenticationCertificates $AuthCert -SslCertificates $frontCert -SslPolicy $SslPolicy -Zone $Zones
+}elseif ($Skutier -eq "WAF") {
+    $AppGateway = New-AzApplicationGateway -Name $apgName -ResourceGroupName $rg_Name -Location $location -BackendAddressPools $BackendPool -BackendHttpSettingsCollection $httpsetting -FrontendIpConfigurations $FrontEndIpConfig  -GatewayIpConfigurations $GatewayIpConfig -FrontendPorts $FrontEndPort -HttpListeners $Listener -RequestRoutingRules $Rule -Sku $Sku -FirewallPolicy $firewallPolicy -AuthenticationCertificates $AuthCert -SslCertificates $frontCert -SslPolicy $SslPolicy
+}
+$endTimeAppGw = Get-Date
+$durationAppGw = New-TimeSpan $startTimeAppGw $endTimeAppGw
+Write-Host "AppGw deployment took " $durationAppGw.minutes "minutes and " $durationAppgw.Seconds "seconds."
+
+# WAF
+Write-Host "Enable WAF."
+$Null = Set-AzApplicationGatewayWebApplicationFirewallConfiguration -ApplicationGateway $AppGateway -FirewallMode "Prevention" -RuleSetType "OWASP" -RuleSetVersion "3.0" -RequestBodyCheck $True -MaxRequestBodySizeInKb 128 -FileUploadLimitInMb 100 -Enabled $True 
+
+# Health probe
+Write-Host "Creating new health-probe matching condition."
+$responseMatch = New-AzApplicationGatewayProbeHealthResponseMatch -StatusCode "200-449"
+Write-Host "Get AppGw Fqdn."
+$PublicIp = Get-AzPublicIpAddress -ResourceGroupName $rg_Name -Name $frontEndIpName
+Write-Host "Creating new Health Probe."
+$healthProbe = New-AzApplicationGatewayProbeConfig -Name $healthProbeName -Protocol $backendProtocol -HostName $PublicIp.DnsSettings.Fqdn -Path $healthProbePath -Interval 30 -Timeout 30 -UnhealthyThreshold 3 -Match $responseMatch
+Write-Host "Add Health Probe to AppGw."
+$AppGateway = Add-AzApplicationGatewayProbeConfig -ApplicationGateway $AppGateway -Name $healthProbeName -Protocol $backendProtocol -HostName $PublicIp.DnsSettings.Fqdn -Path $healthProbePath -Interval 30 -Timeout 30 -UnhealthyThreshold 3 -Match $responseMatch
+
+Write-Host "Set Probe in http-setting."
+$AppGateway = Set-AzApplicationGatewayBackendHttpSettings -ApplicationGateway $AppGateway -Name $httpsettingName -Port $backendPort -Protocol $backendProtocol -CookieBasedAffinity "Enabled" -ConnectionDraining $connectionDraining -AuthenticationCertificates $AuthCert -Probe $healthProbe
+
+Write-Host "Applie WAF and probe to AppGw. This may take a while (about 15 minutes)."
+Write-Host "Current time is" (get-Date).DateTime
+$startTimeAppGw = Get-Date
+$AppGateway = Set-AzApplicationGateway -ApplicationGateway $AppGateway
+$endTimeAppGw = Get-Date
+$durationAppGw = New-TimeSpan $startTimeAppGw $endTimeAppGw
+Write-Host "AppGw reconfiguration took " $durationAppGw.minutes "minutes and " $durationAppgw.Seconds "seconds."
+Write-Host ""
+
+Write-Host "Setting diagnostics."
+#SetDiagnosticsWorkspace
+switch ( ($sub.Split("-")[2] -as [int]) ) {
+    { $_ -le 433 } {
+            Write-Output "This subscription belongs to the legacy Azure directory."
+            $splunkWorkspaceId = "/subscriptions/xyz/resourcegroups/heconazure-loganalytics/providers/microsoft.operationalinsights/workspaces/heconazuresplunk"
+    }
+    { $_ -eq 437 } {
+            Write-Output "This subscription belongs to the legacy Azure directory."
+            $splunkWorkspaceId = "/subscriptions/xyz/resourcegroups/heconazure-loganalytics/providers/microsoft.operationalinsights/workspaces/heconazuresplunk"
+    }
+    { $_ -ge 434 } {
+            Write-Output "This subscription belongs to the shared tenant Azure directory."
+            $splunkWorkspaceId = "/subscriptions/xyz/resourcegroups/heconazureshared-loganalytics/providers/microsoft.operationalinsights/workspaces/heconazuresplunksharedtenant"
+    }
+    Default {
+           Write-Output "Subscription not found in legacy or shared tenant."
+           return -1
+    }
+}
+$diagnosticName="diag-" + $apgName
+$resourceID= $AppGateway.Id
+Set-AzDiagnosticSetting -Name $diagnosticName -ResourceId $resourceID -Enabled $true -Category ApplicationGatewayAccessLog,ApplicationGatewayPerformanceLog,ApplicationGatewayFirewallLog -MetricCategory AllMetrics -WorkspaceId $splunkWorkspaceId | Out-Null
+
+Write-Host "Applie Diagnostics to AppGw. This may take a while (about 5 minutes)."
+$startTimeAppGw = Get-Date
+$AppGateway = Set-AzApplicationGateway -ApplicationGateway $AppGateway
+$endTimeAppGw = Get-Date
+$durationAppGw = New-TimeSpan $startTimeAppGw $endTimeAppGw
+Write-Host "AppGw reconfiguration took " $durationAppGw.minutes "minutes and " $durationAppgw.Seconds "seconds."
+Write-Host ""
+
+Write-Host "New AppGw was configured:" $apgName
+Write-Host ""
+Measure-ScriptTiming -startTime ($startTime)
+
+Write-Host "ToDo:"
+
+if ($fqdn -contains ".hec.xyz.com") {
+    Write-host "Open a Ticket in Service Area: 'Network' and Queue: 'ITI NETWORK SERVICEDESK' ask to mve the ticket to 'ITI NETWORK HEC L2' to configure the DNS."
+} else {
+    Write-host "Open a Ticket in Service Area: 'Managed Cloud Delivery' and Queue: 'MCD SM L3 LINUX' to configure the DNS."
+}
+
+Write-Host $fqdn " -> " $PublicIp.DnsSettings.Fqdn
+
+## To Do: test variables.
